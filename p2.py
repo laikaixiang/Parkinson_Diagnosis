@@ -1,19 +1,25 @@
-# ======================
-# 第二问：诊断模型构建
-# ======================
+import pickle
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, roc_auc_score,
+                             confusion_matrix, roc_curve, auc)
+from xgboost import XGBClassifier
+import warnings
 
-import pymc3 as pm
-import arviz as az
-from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, roc_curve, auc
-from sklearn.model_selection import StratifiedKFold
+warnings.filterwarnings("ignore")
 
-# 1. 加载第一问结果
+# 1. 加载数据
 with open('feature_analysis_results.pkl', 'rb') as f:
     saved_data = pickle.load(f)
     significant_features = saved_data['significant_features']
     feature_groups = saved_data['feature_groups']
     subject_mean = saved_data['subject_mean']
-    data = saved_data['data']
 
 # 2. 特征选择
 selected_features = []
@@ -23,89 +29,112 @@ for group, features in feature_groups.items():
         best_feature = group_features.iloc[0]['Feature']
         selected_features.append(best_feature)
 
+print("最终选择的特征:", selected_features)
+
 # 3. 准备数据
 X = subject_mean[selected_features].values
 y = subject_mean['Status'].values
-gender = subject_mean['Gender'].values
-subject_idx = pd.factorize(subject_mean['ID'])[0]
+gender = subject_mean['Gender'].values.reshape(-1, 1)
 
-# 4. 贝叶斯模型构建
-with pm.Model() as model:
-    mu_w = pm.Normal('mu_w', mu=0, sigma=10, shape=len(selected_features))
-    sigma_w = pm.HalfNormal('sigma_w', sigma=1, shape=len(selected_features))
-    w = pm.Normal('w', mu=mu_w, sigma=sigma_w, shape=(len(subject_mean), len(selected_features)))
-    beta_x = pm.Laplace('beta_x', mu=0, b=1, shape=len(selected_features))
-    beta_z = pm.Normal('beta_z', mu=0, sigma=10)
-    mu = pm.math.dot(w, beta_x) + beta_z * gender
-    p = pm.math.invprobit(mu)
-    y_obs = pm.Bernoulli('y_obs', p=p, observed=y)
-    trace = pm.sample(2000, tune=1000, chains=2, target_accept=0.9)
+# 标准化特征
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-# 5. 模型评估与可视化
-# 轨迹图
-az.plot_trace(trace, var_names=['beta_x', 'beta_z'])
-plt.tight_layout()
-plt.savefig('trace_plot.png')
-plt.close()
+# 添加性别作为特征
+X_final = np.hstack([X_scaled, gender])
 
-# 特征重要性
-beta_x_post = trace['beta_x'].mean(axis=0)
-sorted_idx = np.argsort(-np.abs(beta_x_post))
-plt.figure(figsize=(10, 6))
-plt.barh(np.array(selected_features)[sorted_idx], beta_x_post[sorted_idx])
-plt.xlabel('Coefficient Value')
-plt.title('Feature Importance')
-plt.tight_layout()
-plt.savefig('feature_importance.png')
-plt.close()
+# 4. 定义三种模型
+models = {
+    "Logistic Regression": LogisticRegression(penalty='l2', C=1.0, random_state=42),
+    "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
+    "XGBoost": XGBClassifier(n_estimators=100, max_depth=3, random_state=42, use_label_encoder=False)
+}
 
-# 交叉验证
+# 5. 交叉验证评估
+results = {}
 kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_results = []
-for train_idx, test_idx in kfold.split(X, y):
-    with model:
-        pm.set_data({'w': X[train_idx]})
-        approx = pm.fit(n=3000, method='advi')
-        ppc = approx.sample_posterior_predictive()
-        y_pred = ppc['y_obs'].mean(axis=0) > 0.5
-        cv_results.append({
-            'accuracy': accuracy_score(y[test_idx], y_pred),
-            'auc': roc_auc_score(y[test_idx], ppc['y_obs'].mean(axis=0))
-        })
 
-# 最终评估
-y_pred_proba = pm.math.invprobit(np.dot(X, beta_x_post) + trace['beta_z'].mean() * gender).eval()
-y_pred = (y_pred_proba > 0.5).astype(int)
+for name, model in models.items():
+    print(f"\n正在评估 {name}...")
 
-# 混淆矩阵
-cm = confusion_matrix(y, y_pred)
-plt.figure(figsize=(6, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=['Predicted Healthy', 'Predicted PD'],
-            yticklabels=['Actual Healthy', 'Actual PD'])
-plt.title(f'Confusion Matrix (Accuracy={accuracy_score(y, y_pred):.2f})')
-plt.savefig('confusion_matrix.png')
-plt.close()
+    # 获取预测概率（使用交叉验证）
+    y_proba = cross_val_predict(model, X_final, y, cv=kfold, method='predict_proba')[:, 1]
+    y_pred = (y_proba > 0.5).astype(int)
 
-# ROC曲线
-fpr, tpr, _ = roc_curve(y, y_pred_proba)
-roc_auc = auc(fpr, tpr)
-plt.figure(figsize=(8, 6))
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic')
-plt.legend(loc='lower right')
-plt.savefig('roc_curve.png')
-plt.close()
+    # 计算指标
+    acc = accuracy_score(y, y_pred)
+    roc_auc = roc_auc_score(y, y_proba)
+    cm = confusion_matrix(y, y_pred)
 
-# 保存模型结果
+    # 存储结果
+    results[name] = {
+        'accuracy': acc,
+        'auc': roc_auc,
+        'confusion_matrix': cm,
+        'y_proba': y_proba
+    }
+
+    # 打印结果
+    print(f"{name} 结果:")
+    print(f"准确率: {acc:.3f}")
+    print(f"AUC: {roc_auc:.3f}")
+    print("混淆矩阵:")
+    print(cm)
+
+
+# 6. 可视化结果
+def plot_results(results):
+    # 性能比较
+    metrics = pd.DataFrame({
+        'Model': list(results.keys()),
+        'Accuracy': [x['accuracy'] for x in results.values()],
+        'AUC': [x['auc'] for x in results.values()]
+    }).melt(id_vars='Model', var_name='Metric')
+
+    plt.figure(figsize=(12, 5))
+    sns.barplot(x='Model', y='value', hue='Metric', data=metrics)
+    plt.title('模型性能比较')
+    plt.ylabel('分数')
+    plt.ylim(0, 1.05)
+    plt.tight_layout()
+    plt.savefig('model_comparison.png')
+    plt.close()
+
+    # ROC曲线
+    plt.figure(figsize=(8, 6))
+    for name, res in results.items():
+        fpr, tpr, _ = roc_curve(y, res['y_proba'])
+        plt.plot(fpr, tpr, lw=2, label=f'{name} (AUC = {res["auc"]:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC曲线比较')
+    plt.legend(loc='lower right')
+    plt.savefig('roc_comparison.png')
+    plt.close()
+
+    # 混淆矩阵
+    plt.figure(figsize=(15, 4))
+    for i, (name, res) in enumerate(results.items(), 1):
+        plt.subplot(1, 3, i)
+        sns.heatmap(res['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Predicted Healthy', 'Predicted PD'],
+                    yticklabels=['Actual Healthy', 'Actual PD'])
+        plt.title(f'{name}\nAccuracy: {res["accuracy"]:.2f}')
+    plt.tight_layout()
+    plt.savefig('confusion_matrices.png')
+    plt.close()
+
+
+plot_results(results)
+
+# 7. 保存结果
 with open('model_results.pkl', 'wb') as f:
     pickle.dump({
         'selected_features': selected_features,
-        'trace': trace,
-        'cv_results': cv_results,
-        'y_pred': y_pred,
-        'y_pred_proba': y_pred_proba
+        'results': results,
+        'models': {k: v.get_params() for k, v in models.items()}
     }, f)
+
+print("\n分析完成！结果已保存。")

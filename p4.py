@@ -1,12 +1,14 @@
 import pandas as pd
 import numpy as np
 import pickle
-import pymc3 as pm
-import arviz as az
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (roc_auc_score, accuracy_score,
-                             confusion_matrix, classification_report)
+                             confusion_matrix, classification_report, roc_curve)
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 
 # 1. 加载预处理数据和模型
 with open('feature_analysis_results.pkl', 'rb') as f:
@@ -19,46 +21,42 @@ X = data[selected_features].values
 y_true = data['Status'].values
 subject_ids = data['ID'].values
 recordings = data['Recording'].values
+gender = data['Gender'].values.reshape(-1, 1)
+
+# 标准化特征
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 添加性别作为特征
+X_final = np.hstack([X_scaled, gender])
 
 # 3. 加载训练好的模型
-with pm.Model() as diagnostic_model:
-    # 模型结构定义(与第二问相同)
-    mu_w = pm.Normal('mu_w', mu=0, sigma=10, shape=len(selected_features))
-    sigma_w = pm.HalfNormal('sigma_w', sigma=1, shape=len(selected_features))
-    w = pm.Normal('w', mu=mu_w, sigma=sigma_w,
-                  shape=(len(data), len(selected_features)))
-    beta_x = pm.Laplace('beta_x', mu=0, b=1, shape=len(selected_features))
-    beta_z = pm.Normal('beta_z', mu=0, sigma=10)
-    mu = pm.math.dot(w, beta_x) + beta_z * data['Gender'].values
-    p = pm.math.invprobit(mu)
-    y_obs = pm.Bernoulli('y_obs', p=p, observed=y_true)
+with open('model_results.pkl', 'rb') as f:
+    model_data = pickle.load(f)
+    best_model_name = max(model_data['results'].items(), key=lambda x: x[1]['auc'])[0]
 
-    # 加载训练好的参数
-    with open('model_results.pkl', 'rb') as f:
-        model_data = pickle.load(f)
-        trace = model_data['trace']
+    # 重建最佳模型
+    if best_model_name == "Logistic Regression":
+        model = LogisticRegression(**model_data['models'][best_model_name])
+    elif best_model_name == "Random Forest":
+        model = RandomForestClassifier(**model_data['models'][best_model_name])
+    else:  # XGBoost
+        model = XGBClassifier(**model_data['models'][best_model_name])
+
+    # 使用完整数据重新训练模型（因为p2.py中使用的是交叉验证）
+    model.fit(X_final, y_true)
 
 # 4. 进行诊断预测
-with diagnostic_model:
-    # 使用后验均值作为点估计
-    beta_x_post = trace['beta_x'].mean(axis=0)
-    beta_z_post = trace['beta_z'].mean(axis=0)
-
-    # 计算预测概率
-    pred_proba = pm.math.invprobit(
-        np.dot(X, beta_x_post) +
-        beta_z_post * data['Gender'].values
-    ).eval()
-
-    # 转换为诊断结果(阈值0.5)
-    y_pred = (pred_proba > 0.5).astype(int)
+pred_proba = model.predict_proba(X_final)[:, 1]
+y_pred = (pred_proba > 0.5).astype(int)
 
 # 5. 评估诊断性能
 performance = {
     'accuracy': accuracy_score(y_true, y_pred),
     'auc': roc_auc_score(y_true, pred_proba),
     'confusion_matrix': confusion_matrix(y_true, y_pred),
-    'classification_report': classification_report(y_true, y_pred, output_dict=True)
+    'classification_report': classification_report(y_true, y_pred, output_dict=True),
+    'model_used': best_model_name
 }
 
 # 6. 结果可视化
@@ -68,7 +66,7 @@ cm = performance['confusion_matrix']
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
             xticklabels=['Predicted Healthy', 'Predicted PD'],
             yticklabels=['Actual Healthy', 'Actual PD'])
-plt.title(f'Confusion Matrix (Accuracy={performance["accuracy"]:.2f})')
+plt.title(f'Confusion Matrix ({best_model_name})\nAccuracy={performance["accuracy"]:.2f}')
 plt.savefig('diagnosis_confusion_matrix.png')
 plt.close()
 
@@ -81,7 +79,7 @@ plt.plot(fpr, tpr, color='darkorange', lw=2,
 plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic')
+plt.title(f'Receiver Operating Characteristic ({best_model_name})')
 plt.legend(loc='lower right')
 plt.savefig('diagnosis_roc_curve.png')
 plt.close()
@@ -116,6 +114,7 @@ subject_level_results.to_csv('subject_level_diagnosis.csv', index=False)
 
 # 10. 打印关键性能指标
 print("\n=== 诊断模型性能 ===")
+print(f"使用的模型: {best_model_name}")
 print(f"准确率: {performance['accuracy']:.3f}")
 print(f"AUC: {performance['auc']:.3f}")
 print("\n分类报告:")
